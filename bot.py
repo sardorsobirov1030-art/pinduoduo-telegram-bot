@@ -93,6 +93,41 @@ def walk_json(obj, images, videos):
         for item in obj:
             walk_json(item, images, videos)
 
+def extract_media_from_html(html_text):
+    images, videos = [], []
+
+    # Try to locate goods/gallery/video URLs in any JSON-like script content.
+    patterns = [
+        r'"(?:banner|gallery|image_url|hd_thumb_url|thumb_url)"\s*:\s*"([^"]+)"',
+        r'"(?:url|src|play_url|video_url)"\s*:\s*"([^"]+)"',
+    ]
+    for pattern in patterns:
+        for raw in re.findall(pattern, html_text, re.I):
+            u = clean_url(raw)
+            if not u:
+                continue
+            if is_video(u):
+                videos.append(u)
+            elif looks_like_product_image(u):
+                images.append(u)
+
+    # Also catch escaped URLs.
+    decoded = html.unescape(html_text).replace("\\/", "/").replace("\\u002F", "/")
+    for raw in re.findall(
+        r'https?://[^"\'\\\s<>]+?\.(?:jpg|jpeg|png|webp|mp4)(?:\?[^"\'\\\s<>]*)?',
+        decoded, re.I
+    ):
+        u = clean_url(raw)
+        if not u:
+            continue
+        if is_video(u):
+            videos.append(u)
+        elif looks_like_product_image(u):
+            images.append(u)
+
+    return unique(images), unique(videos)
+
+
 def extract_media(url):
     session = requests.Session()
     response = session.get(
@@ -187,7 +222,29 @@ def extract_media(url):
         elif looks_like_product_image(u):
             images.append(u)
 
-    # 5) goods1 share links can expose media through the assurance/share page.
+    # 5) Direct SSR goods page fallback using goods_id.
+    if not images:
+        try:
+            parsed = urllib.parse.urlparse(final_url)
+            qs = urllib.parse.parse_qs(parsed.query)
+            goods_id = qs.get("goods_id", [None])[0]
+            if goods_id:
+                for goods_url in (
+                    f"https://mobile.yangkeduo.com/goods.html?goods_id={goods_id}",
+                    f"https://mobile.yangkeduo.com/goods1.html?goods_id={goods_id}",
+                ):
+                    rr = session.get(
+                        goods_url, headers=HEADERS, timeout=30, allow_redirects=True
+                    )
+                    i2, v2 = extract_media_from_html(rr.text)
+                    images.extend(i2)
+                    videos.extend(v2)
+                    if images or videos:
+                        break
+        except Exception as e:
+            print("DIRECT GOODS FALLBACK ERROR:", repr(e))
+
+    # 6) goods1 share links can expose media through the assurance/share page.
     if not images:
         try:
             parsed = urllib.parse.urlparse(final_url)
