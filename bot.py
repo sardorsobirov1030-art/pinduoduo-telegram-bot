@@ -103,6 +103,14 @@ def extract_media(url):
     page = response.text
     final_url = response.url
 
+    # Pinduoduo often escapes CDN URLs inside JavaScript/JSON.
+    decoded_page = page
+    for _ in range(3):
+        decoded_page = html.unescape(decoded_page)
+        decoded_page = decoded_page.replace("\\\\/", "/").replace("\\/","/")
+        decoded_page = decoded_page.replace("\\\\u002F", "/").replace("\\u002F", "/")
+        decoded_page = urllib.parse.unquote(decoded_page)
+
     images, videos = [], []
 
     # 1) Pinduoduo share redirect can expose the original product image
@@ -178,6 +186,45 @@ def extract_media(url):
             videos.append(u)
         elif looks_like_product_image(u):
             images.append(u)
+
+    # 5) goods1 share links can expose media through the assurance/share page.
+    if not images:
+        try:
+            parsed = urllib.parse.urlparse(final_url)
+            qs = urllib.parse.parse_qs(parsed.query)
+            goods_id = qs.get("goods_id", [None])[0]
+            if goods_id:
+                share_page = (
+                    "https://mobile.yangkeduo.com/"
+                    "mall_quality_assurance.html?_t_timestamp=comm_share_landing"
+                    f"&goods_id={goods_id}"
+                )
+                r2 = session.get(
+                    share_page, headers=HEADERS, timeout=30, allow_redirects=True
+                )
+                p2 = r2.text
+                d2 = urllib.parse.unquote(
+                    html.unescape(p2).replace("\\\\/", "/").replace("\\/","/")
+                )
+                for raw in re.findall(
+                    r'https?://[^"\\\'\\s<>]+?pddpic\\.com[^"\\\'\\s<>]*',
+                    d2,
+                    re.I
+                ):
+                    u = clean_url(raw)
+                    if u and is_image(u) and looks_like_product_image(u):
+                        images.append(u)
+
+                for raw in re.findall(
+                    r'https?://[^"\\\'\\s<>]+?\\.(?:jpg|jpeg|png|webp)(?:\\?[^"\\\'\\s<>]*)?',
+                    d2,
+                    re.I
+                ):
+                    u = clean_url(raw)
+                    if u and looks_like_product_image(u):
+                        images.append(u)
+        except Exception as e:
+            print("SHARE FALLBACK ERROR:", repr(e))
 
     images = unique(images)[:10]
     videos = unique(videos)[:5]
@@ -317,3 +364,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+            
