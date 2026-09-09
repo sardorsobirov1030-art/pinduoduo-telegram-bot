@@ -1,14 +1,16 @@
 import os
 import re
-import json
 import html
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
 import requests
 from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID")  # Example: @my_channel
+CHANNEL_ID = os.getenv("CHANNEL_ID")
 
 HEADERS = {
     "User-Agent": (
@@ -18,16 +20,15 @@ HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 }
 
+
 def extract_media(url: str):
     r = requests.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
     r.raise_for_status()
     page = r.text
     soup = BeautifulSoup(page, "html.parser")
 
-    images = []
-    videos = []
+    images, videos = [], []
 
-    # Standard OpenGraph image
     for tag in soup.find_all("meta"):
         prop = tag.get("property") or tag.get("name")
         content = tag.get("content")
@@ -36,7 +37,6 @@ def extract_media(url: str):
         if prop in ("og:image", "twitter:image"):
             images.append(html.unescape(content))
 
-    # Direct image/video tags
     for tag in soup.find_all("img"):
         src = tag.get("src") or tag.get("data-src")
         if src and src.startswith(("http://", "https://")):
@@ -51,12 +51,11 @@ def extract_media(url: str):
             if src and src.startswith(("http://", "https://")):
                 videos.append(html.unescape(src))
 
-    # Pinduoduo pages often contain media URLs inside script/JSON.
-    url_patterns = [
+    patterns = [
         r'https?://[^"\'\\\s<>]+?\.(?:jpg|jpeg|png|webp)(?:\?[^"\'\\\s<>]*)?',
         r'https?://[^"\'\\\s<>]+?\.(?:mp4|m3u8)(?:\?[^"\'\\\s<>]*)?',
     ]
-    for pattern in url_patterns:
+    for pattern in patterns:
         for match in re.findall(pattern, page, flags=re.I):
             value = html.unescape(match).replace("\\/", "/")
             if re.search(r'\.(?:mp4|m3u8)', value, re.I):
@@ -65,8 +64,7 @@ def extract_media(url: str):
                 images.append(value)
 
     def unique(items):
-        out = []
-        seen = set()
+        out, seen = [], set()
         for x in items:
             x = x.strip()
             if x and x not in seen:
@@ -105,38 +103,28 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🇺🇿 Telegram orqali yuborildi"
         )
 
-        # First image as Telegram photo
-        if images:
+        for i, image in enumerate(images):
             try:
-                await update.message.reply_photo(images[0], caption=caption)
-            except Exception:
-                pass
-
-        # Remaining images
-        for image in images[1:]:
-            try:
-                await update.message.reply_photo(image)
+                if i == 0:
+                    await update.message.reply_photo(image, caption=caption)
+                else:
+                    await update.message.reply_photo(image)
             except Exception:
                 continue
 
-        # Videos, if direct MP4 links were found
         for video in videos:
             if ".m3u8" in video.lower():
                 continue
             try:
                 await update.message.reply_video(video)
             except Exception:
-                # Telegram may reject a large/non-direct video URL.
                 continue
 
-        # Optional channel posting
         if CHANNEL_ID:
             if images:
                 try:
                     await context.bot.send_photo(
-                        chat_id=CHANNEL_ID,
-                        photo=images[0],
-                        caption=caption
+                        chat_id=CHANNEL_ID, photo=images[0], caption=caption
                     )
                 except Exception:
                     pass
@@ -157,9 +145,30 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print("ERROR:", repr(e))
 
 
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"Pinduoduo Telegram Bot is running.")
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_health_server():
+    port = int(os.getenv("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    print(f"Health server listening on port {port}")
+    server.serve_forever()
+
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN environment variable is missing")
+
+    # Render Web Service uchun port ochib turamiz.
+    threading.Thread(target=start_health_server, daemon=True).start()
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
@@ -170,3 +179,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+            
