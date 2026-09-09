@@ -3,6 +3,8 @@ import re
 import json
 import html
 import urllib.parse
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BytesIO
 
 import requests
@@ -77,6 +79,7 @@ def walk_json(obj, images, videos):
                     )) and is_video(u):
                         videos.append(u)
 
+                    # PDD image/video URLs are often stored under generic "url".
                     if "pddpic.com" in u.lower():
                         if is_video(u):
                             videos.append(u)
@@ -102,11 +105,11 @@ def extract_media(url):
 
     images, videos = [], []
 
+    # 1) Pinduoduo share redirect can expose the original product image
+    # through _oak_share_url.
     for candidate_url in (url, final_url):
         try:
-            qs = urllib.parse.parse_qs(
-                urllib.parse.urlparse(candidate_url).query
-            )
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(candidate_url).query)
             for key in ("_oak_share_url", "_oak_share_url_encoded"):
                 for value in qs.get(key, []):
                     value = urllib.parse.unquote(value)
@@ -116,8 +119,8 @@ def extract_media(url):
         except Exception:
             pass
 
+    # 2) Parse inline rawData / initDataObj JSON.
     soup = BeautifulSoup(page, "html.parser")
-
     scripts = "\n".join(
         s.get_text(" ", strip=False)
         for s in soup.find_all("script")
@@ -141,36 +144,36 @@ def extract_media(url):
             data = json.loads(raw)
             walk_json(data, images, videos)
         except Exception:
+            # If the object is embedded in JS and not strict JSON,
+            # fall back to URL extraction below.
             pass
 
+    # 3) Direct PDD CDN URLs anywhere in the HTML/JS.
     pdd_urls = re.findall(
         r'https?://[^"\'\\\s<>]+?(?:pddpic\.com|yangkeduo\.com|pinduoduo\.com)[^"\'\\\s<>]*',
         page,
         re.I
     )
-
     for raw in pdd_urls:
         u = clean_url(raw)
         if not u:
             continue
-
         if is_video(u):
             videos.append(u)
         elif looks_like_product_image(u):
             images.append(u)
 
+    # 4) Generic image/video URLs as a final fallback, but NEVER use
+    # og:image blindly because it may be the Pinduoduo logo.
     generic = re.findall(
         r'https?://[^"\'\\\s<>]+?\.(?:jpg|jpeg|png|webp|mp4)(?:\?[^"\'\\\s<>]*)?',
         page,
         re.I
     )
-
     for raw in generic:
         u = clean_url(raw)
-
         if not u:
             continue
-
         if is_video(u):
             videos.append(u)
         elif looks_like_product_image(u):
@@ -179,18 +182,13 @@ def extract_media(url):
     images = unique(images)[:10]
     videos = unique(videos)[:5]
 
-    images.sort(
-        key=lambda x: ("pddpic.com" not in x.lower(), len(x))
-    )
+    # Prefer actual product/CDN images.
+    images.sort(key=lambda x: ("pddpic.com" not in x.lower(), len(x)))
 
     return images, videos
 
 def download_file(url):
-    r = requests.get(
-        url,
-        headers=HEADERS,
-        timeout=30
-    )
+    r = requests.get(url, headers=HEADERS, timeout=30)
     r.raise_for_status()
     return BytesIO(r.content)
 
@@ -201,14 +199,11 @@ async def send_media(update, context, images, videos, caption):
         try:
             data = download_file(image)
             data.name = f"product_{i+1}.jpg"
-
             await update.message.reply_photo(
                 photo=data,
                 caption=caption if i == 0 else None
             )
-
             sent_any = True
-
         except Exception as e:
             print("IMAGE ERROR:", repr(e))
 
@@ -216,13 +211,8 @@ async def send_media(update, context, images, videos, caption):
         try:
             data = download_file(video)
             data.name = "product.mp4"
-
-            await update.message.reply_video(
-                video=data
-            )
-
+            await update.message.reply_video(video=data)
             sent_any = True
-
         except Exception as e:
             print("VIDEO ERROR:", repr(e))
 
@@ -237,9 +227,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    status = await update.message.reply_text(
-        "⏳ Mahsulot rasmlari olinmoqda..."
-    )
+    status = await update.message.reply_text("⏳ Mahsulot rasmlari olinmoqda...")
 
     try:
         images, videos = extract_media(text)
@@ -251,23 +239,12 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        caption = (
-            "🛍 Pinduoduo mahsuloti\n"
-            "📌 Manba: Pinduoduo"
-        )
+        caption = "🛍 Pinduoduo mahsuloti\n📌 Manba: Pinduoduo"
 
-        sent = await send_media(
-            update,
-            context,
-            images,
-            videos,
-            caption
-        )
+        sent = await send_media(update, context, images, videos, caption)
 
         if not sent:
-            await status.edit_text(
-                "❌ Rasmni yuklab bo'lmadi."
-            )
+            await status.edit_text("❌ Rasmni yuklab bo'lmadi.")
             return
 
         try:
@@ -275,67 +252,67 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+        # Send the first product image to the configured channel.
         if CHANNEL_ID and images:
             try:
                 data = download_file(images[0])
                 data.name = "product.jpg"
-
                 await context.bot.send_photo(
                     chat_id=CHANNEL_ID,
                     photo=data,
                     caption=caption
                 )
-
             except Exception as e:
-                print(
-                    "CHANNEL IMAGE ERROR:",
-                    repr(e)
-                )
+                print("CHANNEL IMAGE ERROR:", repr(e))
 
         if CHANNEL_ID:
             for video in videos:
                 try:
                     data = download_file(video)
                     data.name = "product.mp4"
-
                     await context.bot.send_video(
                         chat_id=CHANNEL_ID,
                         video=data
                     )
-
                 except Exception as e:
-                    print(
-                        "CHANNEL VIDEO ERROR:",
-                        repr(e)
-                    )
+                    print("CHANNEL VIDEO ERROR:", repr(e))
 
     except Exception as e:
         print("ERROR:", repr(e))
-
         await status.edit_text(
             "❌ Havolani ochishda xatolik.\n"
             "Iltimos, yana bir marta yuboring."
         )
 
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_health_server():
+    port = int(os.environ.get("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
+
+
 def main():
+    threading.Thread(target=start_health_server, daemon=True).start()
+
     if not BOT_TOKEN:
-        raise RuntimeError(
-            "BOT_TOKEN environment variable is missing"
-        )
+        raise RuntimeError("BOT_TOKEN environment variable is missing")
 
-    app = Application.builder().token(
-        BOT_TOKEN
-    ).build()
-
+    app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_link
-        )
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link)
     )
 
     print("Bot ishga tushdi...")
-
     app.run_polling()
 
 if __name__ == "__main__":
