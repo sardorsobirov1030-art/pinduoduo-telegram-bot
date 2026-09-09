@@ -548,15 +548,48 @@ def extract_media(url):
                 )
 
                 for raw in media:
+    url2 = clean_url(raw)
 
-                    url2 = clean_url(raw)
+    if not url2:
+        continue
 
-                    if (
-                        url2
-                        and is_image(url2)
-                        and looks_like_product_image(url2)
-                    ):
-                        images.append(url2)
+    url2 = url2.rstrip("'\"\\),;]}")
+
+    if is_video(url2):
+        videos.append(url2)
+        continue
+
+    if is_image(url2):
+        images.append(url2)
+        continue
+
+    try:
+        probe = session.get(
+            url2,
+            headers={
+                **HEADERS,
+                "Referer": "https://mobile.yangkeduo.com/",
+            },
+            timeout=15,
+            stream=True,
+        )
+
+        content_type = probe.headers.get("content-type", "").lower()
+        probe.close()
+
+        log.info(
+            "SHARE FALLBACK PROBE type=%s url=%s",
+            content_type,
+            safe_url(url2),
+        )
+
+        if content_type.startswith("image/"):
+            images.append(url2)
+        elif content_type.startswith("video/"):
+            videos.append(url2)
+
+    except Exception:
+        log.exception("SHARE FALLBACK PROBE ERROR")
 
         except Exception:
 
