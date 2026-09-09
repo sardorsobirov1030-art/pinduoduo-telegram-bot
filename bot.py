@@ -4,16 +4,31 @@ import json
 import html
 import urllib.parse
 import threading
+import logging
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BytesIO
 
 import requests
 from bs4 import BeautifulSoup
 from telegram import Update
-from telegram.ext import Application, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    Application,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
+# =========================
+# SETTINGS
+# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
+
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger(__name__)
 
 HEADERS = {
     "User-Agent": (
@@ -22,15 +37,26 @@ HEADERS = {
     ),
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     "Referer": "https://mobile.yangkeduo.com/",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Connection": "keep-alive",
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
 }
 
 BAD_WORDS = (
-    "logo", "icon", "favicon", "avatar", "app_icon",
-    "pdd_logo", "yangkeduo_logo", "default_avatar"
+    "logo",
+    "icon",
+    "favicon",
+    "avatar",
+    "app_icon",
+    "pdd_logo",
+    "yangkeduo_logo",
+    "default_avatar",
 )
 
+# =========================
+# HELPERS
+# =========================
 def safe_url(url):
     try:
         p = urllib.parse.urlparse(url)
@@ -38,68 +64,131 @@ def safe_url(url):
     except Exception:
         return str(url)[:200]
 
+
 def clean_url(value):
     if not isinstance(value, str):
         return None
-    value = html.unescape(value).replace("\\/", "/")
+
+    value = html.unescape(value)
+    value = value.replace("\\/", "/")
     value = value.replace("\\u002F", "/")
     value = value.strip().strip('"').strip("'")
+
     if value.startswith("//"):
         value = "https:" + value
+
     if value.startswith(("http://", "https://")):
         return value
+
     return None
 
+
+def unique(items):
+    result = []
+    seen = set()
+
+    for item in items:
+        item = clean_url(item)
+
+        if item and item not in seen:
+            seen.add(item)
+            result.append(item)
+
+    return result
+
+
 def is_image(url):
-    return bool(re.search(r"\.(?:jpg|jpeg|png|webp)(?:[?#].*)?$", url, re.I))
+    return bool(
+        re.search(
+            r"\.(jpg|jpeg|png|webp)(\?.*)?$",
+            url,
+            re.I,
+        )
+    )
+
 
 def is_video(url):
-    return bool(re.search(r"\.(?:mp4)(?:[?#].*)?$", url, re.I))
+    return bool(
+        re.search(
+            r"\.(mp4)(\?.*)?$",
+            url,
+            re.I,
+        )
+    )
+
 
 def looks_like_product_image(url):
     low = url.lower()
+
     if any(word in low for word in BAD_WORDS):
         return False
+
     return is_image(url)
 
-def unique(items):
-    out, seen = [], set()
-    for x in items:
-        x = clean_url(x)
-        if x and x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
 
 def walk_json(obj, images, videos):
     if isinstance(obj, dict):
-        for key, value in obj.items():
-            k = str(key).lower()
-            if isinstance(value, str):
-                u = clean_url(value)
-                if u:
-                    if any(x in k for x in (
-                        "gallery", "banner", "image", "img", "thumb", "pic", "detail"
-                    )) and looks_like_product_image(u):
-                        images.append(u)
-                    elif any(x in k for x in (
-                        "video", "play_url", "video_url", "mp4"
-                    )) and is_video(u):
-                        videos.append(u)
 
-                    if "pddpic.com" in u.lower():
-                        if is_video(u):
-                            videos.append(u)
-                        elif looks_like_product_image(u):
-                            images.append(u)
+        for key, value in obj.items():
+
+            key_lower = str(key).lower()
+
+            if isinstance(value, str):
+
+                url = clean_url(value)
+
+                if not url:
+                    continue
+
+                image_keys = (
+                    "gallery",
+                    "banner",
+                    "image",
+                    "img",
+                    "thumb",
+                    "pic",
+                    "detail",
+                )
+
+                video_keys = (
+                    "video",
+                    "play_url",
+                    "video_url",
+                    "mp4",
+                )
+
+                if any(x in key_lower for x in image_keys):
+                    if looks_like_product_image(url):
+                        images.append(url)
+
+                if any(x in key_lower for x in video_keys):
+                    if is_video(url):
+                        videos.append(url)
+
+                if "pddpic.com" in url.lower():
+
+                    if is_video(url):
+                        videos.append(url)
+
+                    elif looks_like_product_image(url):
+                        images.append(url)
+
             else:
                 walk_json(value, images, videos)
+
     elif isinstance(obj, list):
+
         for item in obj:
             walk_json(item, images, videos)
 
-def extract_media_from_html(html_text):
-    images, videos = [], []
+
+# =========================
+# HTML PARSER
+# =========================
+def extract_media_from_html(page):
+
+    images = []
+    videos = []
 
     patterns = [
         r'"(?:banner|gallery|image_url|hd_thumb_url|thumb_url)"\s*:\s*"([^"]+)"',
@@ -107,94 +196,146 @@ def extract_media_from_html(html_text):
     ]
 
     for pattern in patterns:
-        for raw in re.findall(pattern, html_text, re.I):
-            u = clean_url(raw)
-            if not u:
-                continue
-            if is_video(u):
-                videos.append(u)
-            elif looks_like_product_image(u):
-                images.append(u)
 
-    decoded = html.unescape(html_text).replace("\\/", "/").replace("\\u002F", "/")
-    for raw in re.findall(
-        r'https?://[^"\'\\\s<>]+?\.(?:jpg|jpeg|png|webp|mp4)(?:\?[^"\'\\\s<>]*)?',
-        decoded, re.I
-    ):
-        u = clean_url(raw)
-        if not u:
+        for raw in re.findall(pattern, page, re.I):
+
+            url = clean_url(raw)
+
+            if not url:
+                continue
+
+            if is_video(url):
+                videos.append(url)
+
+            elif looks_like_product_image(url):
+                images.append(url)
+
+    decoded = (
+        html.unescape(page)
+        .replace("\\/", "/")
+        .replace("\\u002F", "/")
+    )
+
+    media_urls = re.findall(
+        r'https?://[^"\'\\\s<>]+?\.(?:jpg|jpeg|png|webp|mp4)'
+        r'(?:\?[^"\'\\\s<>]*)?',
+        decoded,
+        re.I,
+    )
+
+    for raw in media_urls:
+
+        url = clean_url(raw)
+
+        if not url:
             continue
-        if is_video(u):
-            videos.append(u)
-        elif looks_like_product_image(u):
-            images.append(u)
+
+        if is_video(url):
+            videos.append(url)
+
+        elif looks_like_product_image(url):
+            images.append(url)
 
     return unique(images), unique(videos)
 
+
+# =========================
+# PINDUODUO EXTRACTOR
+# =========================
 def extract_media(url):
-    print("\n========== PDD DEBUG START ==========")
-    print("INPUT:", safe_url(url))
+
+    log.info("========== PDD DEBUG START ==========")
+    log.info("INPUT URL: %s", safe_url(url))
 
     session = requests.Session()
 
-    response = session.get(
-        url, headers=HEADERS, timeout=30, allow_redirects=True
-    )
+    try:
 
-    print("HTTP STATUS:", response.status_code)
-    print("FINAL URL:", safe_url(response.url))
-    print("CONTENT TYPE:", response.headers.get("content-type"))
-    print("PAGE LENGTH:", len(response.text))
+        response = session.get(
+            url,
+            headers=HEADERS,
+            timeout=30,
+            allow_redirects=True,
+        )
+
+        log.info("HTTP STATUS: %s", response.status_code)
+        log.info("FINAL URL: %s", safe_url(response.url))
+        log.info(
+            "CONTENT TYPE: %s",
+            response.headers.get("content-type"),
+        )
+        log.info("PAGE LENGTH: %s", len(response.text))
+
+    except Exception as e:
+
+        log.exception("INITIAL REQUEST ERROR")
+
+        return [], []
 
     page = response.text
     final_url = response.url
 
-    print(
-        "MARKERS:",
-        "rawData=", "rawData" in page,
-        "initDataObj=", "initDataObj" in page,
-        "gallery=", "gallery" in page,
-        "banner=", "banner" in page,
-        "pddpic.com=", "pddpic.com" in page,
-        "video=", "video" in page.lower(),
+    log.info(
+        "MARKERS: rawData=%s initDataObj=%s gallery=%s banner=%s "
+        "pddpic=%s video=%s",
+        "rawData" in page,
+        "initDataObj" in page,
+        "gallery" in page,
+        "banner" in page,
+        "pddpic.com" in page,
+        "video" in page.lower(),
     )
 
-    decoded_page = page
-    for _ in range(3):
-        decoded_page = html.unescape(decoded_page)
-        decoded_page = decoded_page.replace("\\\\/", "/").replace("\\/", "/")
-        decoded_page = decoded_page.replace("\\\\u002F", "/").replace("\\u002F", "/")
-        decoded_page = urllib.parse.unquote(decoded_page)
+    images = []
+    videos = []
 
-    images, videos = [], []
+    # -------------------------
+    # 1. _oak_share_url
+    # -------------------------
+    for candidate in (url, final_url):
 
-    # 1) Share URL can expose original product image.
-    for candidate_url in (url, final_url):
         try:
-            qs = urllib.parse.parse_qs(urllib.parse.urlparse(candidate_url).query)
-            for key in ("_oak_share_url", "_oak_share_url_encoded"):
-                for value in qs.get(key, []):
+
+            parsed = urllib.parse.urlparse(candidate)
+            query = urllib.parse.parse_qs(parsed.query)
+
+            for key in (
+                "_oak_share_url",
+                "_oak_share_url_encoded",
+            ):
+
+                for value in query.get(key, []):
+
                     value = urllib.parse.unquote(value)
                     value = clean_url(value)
+
                     if value and looks_like_product_image(value):
                         images.append(value)
-        except Exception as e:
-            print("SHARE PARAM ERROR:", repr(e))
 
-    print("AFTER SHARE PARAM:", len(images), "images")
+        except Exception:
+            log.exception("SHARE PARAM ERROR")
 
-    # 2) Inline JSON.
-    soup = BeautifulSoup(page, "html.parser")
-    scripts = "\n".join(
-        s.get_text(" ", strip=False)
-        for s in soup.find_all("script")
-        if s.get_text()
+    log.info(
+        "AFTER SHARE PARAM: %s images",
+        len(unique(images)),
     )
 
-    print("SCRIPT LENGTH:", len(scripts))
-    print("SCRIPT COUNT:", len(soup.find_all("script")))
+    # -------------------------
+    # 2. JSON / scripts
+    # -------------------------
+    soup = BeautifulSoup(page, "html.parser")
+
+    scripts = "\n".join(
+        script.get_text(" ", strip=False)
+        for script in soup.find_all("script")
+        if script.get_text()
+    )
+
+    log.info("SCRIPT COUNT: %s", len(soup.find_all("script")))
+    log.info("SCRIPT LENGTH: %s", len(scripts))
 
     json_candidates = []
+
     patterns = [
         r"window\.rawData\s*=\s*(\{.*?\})\s*;",
         r"rawData\s*=\s*(\{.*?\})\s*;",
@@ -202,200 +343,361 @@ def extract_media(url):
     ]
 
     for pattern in patterns:
-        found = re.findall(pattern, scripts, re.S)
-        print("JSON PATTERN MATCHES:", len(found))
+
+        found = re.findall(
+            pattern,
+            scripts,
+            re.S,
+        )
+
+        log.info(
+            "JSON PATTERN MATCHES: %s",
+            len(found),
+        )
+
         json_candidates.extend(found)
 
     for raw in json_candidates:
+
         try:
+
             data = json.loads(raw)
             walk_json(data, images, videos)
+
         except Exception:
             pass
 
-    print("AFTER JSON:", len(images), "images", len(videos), "videos")
-
-    # 3) Direct CDN URLs.
-    pdd_urls = re.findall(
-        r'https?://[^"\'\\\s<>]+?(?:pddpic\.com|yangkeduo\.com|pinduoduo\.com)[^"\'\\\s<>]*',
-        page, re.I
+    log.info(
+        "AFTER JSON: %s images / %s videos",
+        len(unique(images)),
+        len(unique(videos)),
     )
 
-    print("DIRECT PDD URL MATCHES:", len(pdd_urls))
+    # -------------------------
+    # 3. Direct PDD CDN
+    # -------------------------
+    pdd_urls = re.findall(
+        r'https?://[^"\'\\\s<>]+?(?:pddpic\.com|yangkeduo\.com|pinduoduo\.com)'
+        r'[^"\'\\\s<>]*',
+        page,
+        re.I,
+    )
+
+    log.info(
+        "DIRECT PDD URL MATCHES: %s",
+        len(pdd_urls),
+    )
 
     for raw in pdd_urls:
-        u = clean_url(raw)
-        if not u:
-            continue
-        if is_video(u):
-            videos.append(u)
-        elif looks_like_product_image(u):
-            images.append(u)
 
-    # 4) Generic media.
+        url2 = clean_url(raw)
+
+        if not url2:
+            continue
+
+        if is_video(url2):
+            videos.append(url2)
+
+        elif looks_like_product_image(url2):
+            images.append(url2)
+
+    # -------------------------
+    # 4. Generic media
+    # -------------------------
     generic = re.findall(
-        r'https?://[^"\'\\\s<>]+?\.(?:jpg|jpeg|png|webp|mp4)(?:\?[^"\'\\\s<>]*)?',
-        page, re.I
+        r'https?://[^"\'\\\s<>]+?\.(?:jpg|jpeg|png|webp|mp4)'
+        r'(?:\?[^"\'\\\s<>]*)?',
+        page,
+        re.I,
     )
 
-    print("GENERIC MEDIA MATCHES:", len(generic))
+    log.info(
+        "GENERIC MEDIA MATCHES: %s",
+        len(generic),
+    )
 
     for raw in generic:
-        u = clean_url(raw)
-        if not u:
+
+        url2 = clean_url(raw)
+
+        if not url2:
             continue
-        if is_video(u):
-            videos.append(u)
-        elif looks_like_product_image(u):
-            images.append(u)
 
-    # 5) Direct goods fallback.
+        if is_video(url2):
+            videos.append(url2)
+
+        elif looks_like_product_image(url2):
+            images.append(url2)
+
+    # -------------------------
+    # 5. Direct goods fallback
+    # -------------------------
     if not images:
-        try:
-            parsed = urllib.parse.urlparse(final_url)
-            qs = urllib.parse.parse_qs(parsed.query)
-            goods_id = qs.get("goods_id", [None])[0]
 
-            print("GOODS ID:", goods_id)
+        try:
+
+            parsed = urllib.parse.urlparse(final_url)
+            query = urllib.parse.parse_qs(parsed.query)
+
+            goods_id = query.get(
+                "goods_id",
+                [None],
+            )[0]
+
+            log.info("GOODS ID: %s", goods_id)
 
             if goods_id:
-                for goods_url in (
+
+                goods_urls = [
                     f"https://mobile.yangkeduo.com/goods.html?goods_id={goods_id}",
                     f"https://mobile.yangkeduo.com/goods1.html?goods_id={goods_id}",
-                ):
+                ]
+
+                for goods_url in goods_urls:
+
                     rr = session.get(
-                        goods_url, headers=HEADERS, timeout=30, allow_redirects=True
+                        goods_url,
+                        headers=HEADERS,
+                        timeout=30,
+                        allow_redirects=True,
                     )
 
-                    print(
-                        "DIRECT GOODS:",
-                        safe_url(goods_url),
-                        "STATUS=", rr.status_code,
-                        "FINAL=", safe_url(rr.url),
-                        "LENGTH=", len(rr.text),
+                    log.info(
+                        "DIRECT GOODS STATUS=%s FINAL=%s LENGTH=%s",
+                        rr.status_code,
+                        safe_url(rr.url),
+                        len(rr.text),
                     )
 
-                    i2, v2 = extract_media_from_html(rr.text)
-                    print("DIRECT GOODS MEDIA:", len(i2), "images", len(v2), "videos")
+                    i2, v2 = extract_media_from_html(
+                        rr.text
+                    )
+
+                    log.info(
+                        "DIRECT GOODS MEDIA=%s images / %s videos",
+                        len(i2),
+                        len(v2),
+                    )
 
                     images.extend(i2)
                     videos.extend(v2)
 
                     if images or videos:
                         break
-        except Exception as e:
-            print("DIRECT GOODS FALLBACK ERROR:", repr(e))
 
-    # 6) Assurance/share fallback.
+        except Exception:
+
+            log.exception(
+                "DIRECT GOODS FALLBACK ERROR"
+            )
+
+    # -------------------------
+    # 6. Assurance fallback
+    # -------------------------
     if not images:
+
         try:
+
             parsed = urllib.parse.urlparse(final_url)
-            qs = urllib.parse.parse_qs(parsed.query)
-            goods_id = qs.get("goods_id", [None])[0]
+            query = urllib.parse.parse_qs(parsed.query)
+
+            goods_id = query.get(
+                "goods_id",
+                [None],
+            )[0]
 
             if goods_id:
+
                 share_page = (
                     "https://mobile.yangkeduo.com/"
-                    "mall_quality_assurance.html?_t_timestamp=comm_share_landing"
+                    "mall_quality_assurance.html"
+                    "?_t_timestamp=comm_share_landing"
                     f"&goods_id={goods_id}"
                 )
 
-                r2 = session.get(
-                    share_page, headers=HEADERS, timeout=30, allow_redirects=True
+                rr = session.get(
+                    share_page,
+                    headers=HEADERS,
+                    timeout=30,
+                    allow_redirects=True,
                 )
 
-                print(
-                    "SHARE FALLBACK:",
-                    r2.status_code,
-                    safe_url(r2.url),
-                    "LENGTH=", len(r2.text),
+                log.info(
+                    "SHARE FALLBACK STATUS=%s FINAL=%s LENGTH=%s",
+                    rr.status_code,
+                    safe_url(rr.url),
+                    len(rr.text),
                 )
 
-                p2 = r2.text
-                d2 = urllib.parse.unquote(
-                    html.unescape(p2).replace("\\\\/", "/").replace("\\/", "/")
+                decoded = (
+                    html.unescape(rr.text)
+                    .replace("\\/", "/")
+                    .replace("\\u002F", "/")
                 )
 
-                for raw in re.findall(
-                    r'https?://[^"\\\'\s<>]+?pddpic\.com[^"\\\'\s<>]*',
-                    d2, re.I
-                ):
-                    u = clean_url(raw)
-                    if u and is_image(u) and looks_like_product_image(u):
-                        images.append(u)
-
-                for raw in re.findall(
-                    r'https?://[^"\\\'\s<>]+?\.(?:jpg|jpeg|png|webp)(?:\?[^"\\\'\s<>]*)?',
-                    d2, re.I
-                ):
-                    u = clean_url(raw)
-                    if u and looks_like_product_image(u):
-                        images.append(u)
-
-                print(
-                    "SHARE FALLBACK MEDIA:",
-                    len(unique(images)),
-                    "images"
+                media = re.findall(
+                    r'https?://[^"\'\\\s<>]+?pddpic\.com'
+                    r'[^"\'\\\s<>]*',
+                    decoded,
+                    re.I,
                 )
 
-        except Exception as e:
-            print("SHARE FALLBACK ERROR:", repr(e))
+                log.info(
+                    "SHARE FALLBACK PDD URLS=%s",
+                    len(media),
+                )
+
+                for raw in media:
+
+                    url2 = clean_url(raw)
+
+                    if (
+                        url2
+                        and is_image(url2)
+                        and looks_like_product_image(url2)
+                    ):
+                        images.append(url2)
+
+        except Exception:
+
+            log.exception(
+                "SHARE FALLBACK ERROR"
+            )
 
     images = unique(images)[:10]
     videos = unique(videos)[:5]
-    images.sort(key=lambda x: ("pddpic.com" not in x.lower(), len(x)))
 
-    print("FINAL MEDIA:", len(images), "images", len(videos), "videos")
-    print("========== PDD DEBUG END ==========\n")
+    images.sort(
+        key=lambda x: (
+            "pddpic.com" not in x.lower(),
+            len(x),
+        )
+    )
+
+    log.info(
+        "FINAL MEDIA: %s images / %s videos",
+        len(images),
+        len(videos),
+    )
+
+    log.info("========== PDD DEBUG END ==========")
 
     return images, videos
 
+
+# =========================
+# DOWNLOAD
+# =========================
 def download_file(url):
-    r = requests.get(url, headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    return BytesIO(r.content)
 
-async def send_media(update, context, images, videos, caption):
-    sent_any = False
+    response = requests.get(
+        url,
+        headers=HEADERS,
+        timeout=30,
+    )
 
-    for i, image in enumerate(images):
+    response.raise_for_status()
+
+    data = BytesIO(response.content)
+
+    return data
+
+
+# =========================
+# TELEGRAM
+# =========================
+async def send_media(
+    update,
+    images,
+    videos,
+    caption,
+):
+
+    sent = False
+
+    for index, image in enumerate(images):
+
         try:
+
             data = download_file(image)
-            data.name = f"product_{i+1}.jpg"
+            data.name = f"product_{index + 1}.jpg"
 
             await update.message.reply_photo(
                 photo=data,
-                caption=caption if i == 0 else None
+                caption=caption if index == 0 else None,
             )
 
-            sent_any = True
+            sent = True
 
-        except Exception as e:
-            print("IMAGE ERROR:", repr(e))
+        except Exception:
+
+            log.exception("IMAGE SEND ERROR")
 
     for video in videos:
+
         try:
+
             data = download_file(video)
             data.name = "product.mp4"
 
-            await update.message.reply_video(video=data)
+            await update.message.reply_video(
+                video=data,
+            )
 
-            sent_any = True
+            sent = True
 
-        except Exception as e:
-            print("VIDEO ERROR:", repr(e))
+        except Exception:
 
-    return sent_any
+            log.exception("VIDEO SEND ERROR")
 
-async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
+    return sent
 
-    print("\nTELEGRAM INPUT RECEIVED")
-    print("CHAT ID:", update.effective_chat.id if update.effective_chat else None)
-    print("MESSAGE LENGTH:", len(text))
 
-    if "pinduoduo.com" not in text and "yangkeduo.com" not in text:
-        await update.message.reply_text("Pinduoduo havolasini yuboring.")
+async def handle_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    text = (
+        update.message.text
+        if update.message
+        else ""
+    ).strip()
+
+    log.info("========== TELEGRAM MESSAGE ==========")
+
+    log.info(
+        "CHAT ID: %s",
+        update.effective_chat.id
+        if update.effective_chat
+        else None,
+    )
+
+    log.info(
+        "TEXT LENGTH: %s",
+        len(text),
+    )
+
+    if text.upper() == "TEST":
+
+        log.info("TEST MESSAGE RECEIVED")
+
+        await update.message.reply_text(
+            "✅ BOT IS WORKING!\n"
+            "Telegram connection OK."
+        )
+
+        return
+
+    if (
+        "pinduoduo.com" not in text
+        and "yangkeduo.com" not in text
+    ):
+
+        await update.message.reply_text(
+            "Pinduoduo havolasini yuboring."
+        )
+
         return
 
     status = await update.message.reply_text(
@@ -403,23 +705,36 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
+
         images, videos = extract_media(text)
 
         if not images and not videos:
+
             await status.edit_text(
                 "❌ Mahsulot rasmi topilmadi.\n"
-                "Pinduoduo sahifasi media ma'lumotlarini yashirgan bo'lishi mumkin."
+                "Logs orqali sababini aniqlaymiz."
             )
+
             return
 
-        caption = "🛍 Pinduoduo mahsuloti\n📌 Manba: Pinduoduo"
+        caption = (
+            "🛍 Pinduoduo mahsuloti\n"
+            "📌 Manba: Pinduoduo"
+        )
 
         sent = await send_media(
-            update, context, images, videos, caption
+            update,
+            images,
+            videos,
+            caption,
         )
 
         if not sent:
-            await status.edit_text("❌ Rasmni yuklab bo'lmadi.")
+
+            await status.edit_text(
+                "❌ Rasmni yuklab bo'lmadi."
+            )
+
             return
 
         try:
@@ -427,78 +742,193 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+        # CHANNEL
         if CHANNEL_ID and images:
+
             try:
-                data = download_file(images[0])
+
+                data = download_file(
+                    images[0]
+                )
+
                 data.name = "product.jpg"
 
                 await context.bot.send_photo(
                     chat_id=CHANNEL_ID,
                     photo=data,
-                    caption=caption
+                    caption=caption,
                 )
 
-            except Exception as e:
-                print("CHANNEL IMAGE ERROR:", repr(e))
+                log.info(
+                    "CHANNEL IMAGE SENT"
+                )
+
+            except Exception:
+
+                log.exception(
+                    "CHANNEL IMAGE ERROR"
+                )
 
         if CHANNEL_ID:
+
             for video in videos:
+
                 try:
-                    data = download_file(video)
+
+                    data = download_file(
+                        video
+                    )
+
                     data.name = "product.mp4"
 
                     await context.bot.send_video(
                         chat_id=CHANNEL_ID,
-                        video=data
+                        video=data,
                     )
 
-                except Exception as e:
-                    print("CHANNEL VIDEO ERROR:", repr(e))
+                    log.info(
+                        "CHANNEL VIDEO SENT"
+                    )
 
-    except Exception as e:
-        print("ERROR:", repr(e))
+                except Exception:
 
-        await status.edit_text(
-            "❌ Havolani ochishda xatolik.\n"
-            "Iltimos, yana bir marta yuboring."
+                    log.exception(
+                        "CHANNEL VIDEO ERROR"
+                    )
+
+    except Exception:
+
+        log.exception(
+            "HANDLE MESSAGE ERROR"
         )
 
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
+        try:
 
-    def log_message(self, format, *args):
+            await status.edit_text(
+                "❌ Xatolik yuz berdi."
+            )
+
+        except Exception:
+            pass
+
+
+async def error_handler(
+    update,
+    context,
+):
+
+    log.exception(
+        "TELEGRAM ERROR",
+        exc_info=context.error,
+    )
+
+
+# =========================
+# RENDER HEALTH SERVER
+# =========================
+class HealthHandler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+
+        self.send_response(200)
+        self.send_header(
+            "Content-Type",
+            "text/plain",
+        )
+        self.end_headers()
+
+        self.wfile.write(
+            b"OK"
+        )
+
+    def log_message(
+        self,
+        format,
+        *args,
+    ):
         return
 
+
 def start_health_server():
-    port = int(os.environ.get("PORT", "10000"))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+
+    port = int(
+        os.getenv(
+            "PORT",
+            "10000",
+        )
+    )
+
+    server = HTTPServer(
+        (
+            "0.0.0.0",
+            port,
+        ),
+        HealthHandler,
+    )
+
+    log.info(
+        "HEALTH SERVER STARTED ON PORT %s",
+        port,
+    )
+
     server.serve_forever()
 
+
+# =========================
+# MAIN
+# =========================
 def main():
-    threading.Thread(
-        target=start_health_server,
-        daemon=True
-    ).start()
+
+    log.info("==============================")
+    log.info("STARTING PINDUODUO TELEGRAM BOT")
+    log.info("==============================")
 
     if not BOT_TOKEN:
+
+        log.error(
+            "BOT_TOKEN IS MISSING!"
+        )
+
         raise RuntimeError(
             "BOT_TOKEN environment variable is missing"
         )
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    threading.Thread(
+        target=start_health_server,
+        daemon=True,
+    ).start()
+
+    app = (
+        Application
+        .builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
 
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
-            handle_link
+            handle_message,
         )
     )
 
-    print("Bot ishga tushdi...")
-    app.run_polling()
+    app.add_error_handler(
+        error_handler
+    )
+
+    log.info(
+        "BOT APPLICATION CREATED"
+    )
+
+    log.info(
+        "BOT POLLING STARTING..."
+    )
+
+    app.run_polling(
+        drop_pending_updates=False
+    )
+
 
 if __name__ == "__main__":
     main()
+    
