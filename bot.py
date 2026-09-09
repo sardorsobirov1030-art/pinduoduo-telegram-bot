@@ -1,8 +1,9 @@
 import os
 import re
+import json
 import html
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import urllib.parse
+from io import BytesIO
 
 import requests
 from bs4 import BeautifulSoup
@@ -18,165 +19,324 @@ HEADERS = {
         "(KHTML, like Gecko) Chrome/128.0 Mobile Safari/537.36"
     ),
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Referer": "https://mobile.yangkeduo.com/",
 }
 
+BAD_WORDS = (
+    "logo", "icon", "favicon", "avatar", "app_icon",
+    "pdd_logo", "yangkeduo_logo", "default_avatar"
+)
 
-def extract_media(url: str):
-    r = requests.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
-    r.raise_for_status()
-    page = r.text
-    soup = BeautifulSoup(page, "html.parser")
+def clean_url(value):
+    if not isinstance(value, str):
+        return None
+    value = html.unescape(value).replace("\\/", "/")
+    value = value.replace("\\u002F", "/")
+    value = value.strip().strip('"').strip("'")
+    if value.startswith("//"):
+        value = "https:" + value
+    if value.startswith(("http://", "https://")):
+        return value
+    return None
+
+def is_image(url):
+    return bool(re.search(r"\.(?:jpg|jpeg|png|webp)(?:[?#].*)?$", url, re.I))
+
+def is_video(url):
+    return bool(re.search(r"\.(?:mp4)(?:[?#].*)?$", url, re.I))
+
+def looks_like_product_image(url):
+    low = url.lower()
+    if any(word in low for word in BAD_WORDS):
+        return False
+    return is_image(url)
+
+def unique(items):
+    out, seen = [], set()
+    for x in items:
+        x = clean_url(x)
+        if x and x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+def walk_json(obj, images, videos):
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            k = str(key).lower()
+
+            if isinstance(value, str):
+                u = clean_url(value)
+                if u:
+                    if any(x in k for x in (
+                        "gallery", "banner", "image", "img", "thumb", "pic", "detail"
+                    )) and looks_like_product_image(u):
+                        images.append(u)
+                    elif any(x in k for x in (
+                        "video", "play_url", "video_url", "mp4"
+                    )) and is_video(u):
+                        videos.append(u)
+
+                    if "pddpic.com" in u.lower():
+                        if is_video(u):
+                            videos.append(u)
+                        elif looks_like_product_image(u):
+                            images.append(u)
+
+            else:
+                walk_json(value, images, videos)
+
+    elif isinstance(obj, list):
+        for item in obj:
+            walk_json(item, images, videos)
+
+def extract_media(url):
+    session = requests.Session()
+    response = session.get(
+        url, headers=HEADERS, timeout=30, allow_redirects=True
+    )
+    response.raise_for_status()
+
+    page = response.text
+    final_url = response.url
 
     images, videos = [], []
 
-    for tag in soup.find_all("meta"):
-        prop = tag.get("property") or tag.get("name")
-        content = tag.get("content")
-        if not content:
-            continue
-        if prop in ("og:image", "twitter:image"):
-            images.append(html.unescape(content))
+    for candidate_url in (url, final_url):
+        try:
+            qs = urllib.parse.parse_qs(
+                urllib.parse.urlparse(candidate_url).query
+            )
+            for key in ("_oak_share_url", "_oak_share_url_encoded"):
+                for value in qs.get(key, []):
+                    value = urllib.parse.unquote(value)
+                    value = clean_url(value)
+                    if value and looks_like_product_image(value):
+                        images.append(value)
+        except Exception:
+            pass
 
-    for tag in soup.find_all("img"):
-        src = tag.get("src") or tag.get("data-src")
-        if src and src.startswith(("http://", "https://")):
-            images.append(html.unescape(src))
+    soup = BeautifulSoup(page, "html.parser")
 
-    for tag in soup.find_all("video"):
-        src = tag.get("src")
-        if src and src.startswith(("http://", "https://")):
-            videos.append(html.unescape(src))
-        for source in tag.find_all("source"):
-            src = source.get("src")
-            if src and src.startswith(("http://", "https://")):
-                videos.append(html.unescape(src))
+    scripts = "\n".join(
+        s.get_text(" ", strip=False)
+        for s in soup.find_all("script")
+        if s.get_text()
+    )
+
+    json_candidates = []
 
     patterns = [
-        r'https?://[^"\'\\\s<>]+?\.(?:jpg|jpeg|png|webp)(?:\?[^"\'\\\s<>]*)?',
-        r'https?://[^"\'\\\s<>]+?\.(?:mp4|m3u8)(?:\?[^"\'\\\s<>]*)?',
+        r"window\.rawData\s*=\s*(\{.*?\})\s*;",
+        r"rawData\s*=\s*(\{.*?\})\s*;",
+        r"store\.initDataObj\s*=\s*(\{.*?\})\s*;",
     ]
+
     for pattern in patterns:
-        for match in re.findall(pattern, page, flags=re.I):
-            value = html.unescape(match).replace("\\/", "/")
-            if re.search(r'\.(?:mp4|m3u8)', value, re.I):
-                videos.append(value)
-            else:
-                images.append(value)
+        for match in re.findall(pattern, scripts, re.S):
+            json_candidates.append(match)
 
-    def unique(items):
-        out, seen = [], set()
-        for x in items:
-            x = x.strip()
-            if x and x not in seen:
-                seen.add(x)
-                out.append(x)
-        return out
+    for raw in json_candidates:
+        try:
+            data = json.loads(raw)
+            walk_json(data, images, videos)
+        except Exception:
+            pass
 
-    return unique(images)[:10], unique(videos)[:5]
+    pdd_urls = re.findall(
+        r'https?://[^"\'\\\s<>]+?(?:pddpic\.com|yangkeduo\.com|pinduoduo\.com)[^"\'\\\s<>]*',
+        page,
+        re.I
+    )
 
+    for raw in pdd_urls:
+        u = clean_url(raw)
+        if not u:
+            continue
+
+        if is_video(u):
+            videos.append(u)
+        elif looks_like_product_image(u):
+            images.append(u)
+
+    generic = re.findall(
+        r'https?://[^"\'\\\s<>]+?\.(?:jpg|jpeg|png|webp|mp4)(?:\?[^"\'\\\s<>]*)?',
+        page,
+        re.I
+    )
+
+    for raw in generic:
+        u = clean_url(raw)
+
+        if not u:
+            continue
+
+        if is_video(u):
+            videos.append(u)
+        elif looks_like_product_image(u):
+            images.append(u)
+
+    images = unique(images)[:10]
+    videos = unique(videos)[:5]
+
+    images.sort(
+        key=lambda x: ("pddpic.com" not in x.lower(), len(x))
+    )
+
+    return images, videos
+
+def download_file(url):
+    r = requests.get(
+        url,
+        headers=HEADERS,
+        timeout=30
+    )
+    r.raise_for_status()
+    return BytesIO(r.content)
+
+async def send_media(update, context, images, videos, caption):
+    sent_any = False
+
+    for i, image in enumerate(images):
+        try:
+            data = download_file(image)
+            data.name = f"product_{i+1}.jpg"
+
+            await update.message.reply_photo(
+                photo=data,
+                caption=caption if i == 0 else None
+            )
+
+            sent_any = True
+
+        except Exception as e:
+            print("IMAGE ERROR:", repr(e))
+
+    for video in videos:
+        try:
+            data = download_file(video)
+            data.name = "product.mp4"
+
+            await update.message.reply_video(
+                video=data
+            )
+
+            sent_any = True
+
+        except Exception as e:
+            print("VIDEO ERROR:", repr(e))
+
+    return sent_any
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
-    if not ("pinduoduo.com" in text or "yangkeduo.com" in text):
+    if "pinduoduo.com" not in text and "yangkeduo.com" not in text:
         await update.message.reply_text(
-            "Pinduoduo havolasini yuboring.\n\n"
-            "Masalan: https://mobile.yangkeduo.com/goods.html?goods_id=..."
+            "Pinduoduo havolasini yuboring."
         )
         return
 
-    await update.message.reply_text("⏳ Havola tekshirilmoqda...")
+    status = await update.message.reply_text(
+        "⏳ Mahsulot rasmlari olinmoqda..."
+    )
 
     try:
         images, videos = extract_media(text)
 
         if not images and not videos:
-            await update.message.reply_text(
-                "❌ Media topilmadi.\n"
+            await status.edit_text(
+                "❌ Mahsulot rasmi topilmadi.\n"
                 "Pinduoduo sahifasi media ma'lumotlarini yashirgan bo'lishi mumkin."
             )
             return
 
         caption = (
-            "🛍 Pinduoduo mahsuloti\n\n"
-            "📌 Manba: Pinduoduo\n"
-            "🇺🇿 Telegram orqali yuborildi"
+            "🛍 Pinduoduo mahsuloti\n"
+            "📌 Manba: Pinduoduo"
         )
 
-        for i, image in enumerate(images):
-            try:
-                if i == 0:
-                    await update.message.reply_photo(image, caption=caption)
-                else:
-                    await update.message.reply_photo(image)
-            except Exception:
-                continue
+        sent = await send_media(
+            update,
+            context,
+            images,
+            videos,
+            caption
+        )
 
-        for video in videos:
-            if ".m3u8" in video.lower():
-                continue
+        if not sent:
+            await status.edit_text(
+                "❌ Rasmni yuklab bo'lmadi."
+            )
+            return
+
+        try:
+            await status.delete()
+        except Exception:
+            pass
+
+        if CHANNEL_ID and images:
             try:
-                await update.message.reply_video(video)
-            except Exception:
-                continue
+                data = download_file(images[0])
+                data.name = "product.jpg"
+
+                await context.bot.send_photo(
+                    chat_id=CHANNEL_ID,
+                    photo=data,
+                    caption=caption
+                )
+
+            except Exception as e:
+                print(
+                    "CHANNEL IMAGE ERROR:",
+                    repr(e)
+                )
 
         if CHANNEL_ID:
-            if images:
-                try:
-                    await context.bot.send_photo(
-                        chat_id=CHANNEL_ID, photo=images[0], caption=caption
-                    )
-                except Exception:
-                    pass
-
             for video in videos:
-                if ".m3u8" in video.lower():
-                    continue
                 try:
-                    await context.bot.send_video(chat_id=CHANNEL_ID, video=video)
-                except Exception:
-                    continue
+                    data = download_file(video)
+                    data.name = "product.mp4"
+
+                    await context.bot.send_video(
+                        chat_id=CHANNEL_ID,
+                        video=data
+                    )
+
+                except Exception as e:
+                    print(
+                        "CHANNEL VIDEO ERROR:",
+                        repr(e)
+                    )
 
     except Exception as e:
-        await update.message.reply_text(
-            "❌ Havolani ochishda xatolik yuz berdi.\n"
-            "Boshqa Pinduoduo havolasini sinab ko‘ring."
-        )
         print("ERROR:", repr(e))
 
-
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"Pinduoduo Telegram Bot is running.")
-
-    def log_message(self, format, *args):
-        return
-
-
-def start_health_server():
-    port = int(os.getenv("PORT", "10000"))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    print(f"Health server listening on port {port}")
-    server.serve_forever()
-
+        await status.edit_text(
+            "❌ Havolani ochishda xatolik.\n"
+            "Iltimos, yana bir marta yuboring."
+        )
 
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN environment variable is missing")
+        raise RuntimeError(
+            "BOT_TOKEN environment variable is missing"
+        )
 
-    # Render Web Service uchun port ochib turamiz.
-    threading.Thread(target=start_health_server, daemon=True).start()
+    app = Application.builder().token(
+        BOT_TOKEN
+    ).build()
 
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_link
+        )
+    )
 
     print("Bot ishga tushdi...")
-    app.run_polling()
 
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
-            
